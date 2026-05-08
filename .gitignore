@@ -1,0 +1,50 @@
+# Project management / session docs
+log.md
+LEARNINGS.md
+CONTEXT.md
+ROADMAP.md
+HANDOFF.md
+CLAUDE.md
+nextsteps.md
+progress.csv
+skill-progress-tracking.md
+skill-weakness-training.md
+EXERCISE_LOG.md
+DEBUG_LOG.md
+reading/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Model weights / large files
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace cache
+.cache/
+
+# Plots (regenerable)
+plots/*.png
+plots/*.pdf
