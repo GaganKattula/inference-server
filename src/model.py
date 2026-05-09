@@ -261,18 +261,25 @@ class Decoder(nn.Module):
         
 
 
-def load_hf_weights(model: Decoder, model_name: str):
+def load_hf_weights(model: Decoder, model_name_or_state_dict):
     """Load HF pretrained weights into our Decoder by renaming state_dict keys.
 
     HF and our model have the same weights but different key names.
     This function renames HF keys to match our model, then loads them.
+
+    Args:
+        model: our Decoder instance
+        model_name_or_state_dict: HF model ID string (downloads weights) OR
+            a pre-loaded state_dict (OrderedDict) — useful in tests where the
+            HF model is already in memory and no download is needed.
     """
     from transformers import AutoModelForCausalLM
 
-    # Step 1: Download HF model and get its weights as a dictionary
-    # Keys are strings like "model.layers.0.self_attn.q_proj.weight"
-    # Values are the actual weight tensors
-    hf_state_dict = AutoModelForCausalLM.from_pretrained(model_name).state_dict()
+    # Step 1: Get HF state dict — either download it or use the one provided
+    if isinstance(model_name_or_state_dict, dict):
+        hf_state_dict = model_name_or_state_dict
+    else:
+        hf_state_dict = AutoModelForCausalLM.from_pretrained(model_name_or_state_dict).state_dict()
 
     # Step 2: Build a new dictionary with our key names
     new_dict = {}
