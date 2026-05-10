@@ -27,7 +27,7 @@ def test_scheduler_equivalence():
         max_position_embeddings=128,
         rms_norm_eps=1e-5,
         rope_theta=500000.0,
-        head_dim=64,
+        head_dim=64
     )
     # 1. Created model
     hf_model = LlamaForCausalLM(hf_config)
@@ -44,7 +44,9 @@ def test_scheduler_equivalence():
             rms_norm_eps=hf_config.rms_norm_eps,
             rope_theta=hf_config.rope_theta,
             act_fn="silu",
-            dtype="float16")
+            dtype="float16",
+            num_blocks=20,
+            block_size=4)
     
     our_model = Decoder(our_config)
     load_hf_weights(our_model, hf_model.state_dict())
@@ -66,12 +68,13 @@ def test_scheduler_equivalence():
     
     # 4. Paged Generation loop
     caches = None
+
     scheduler.add_request(request)  # enqueue once before the loop
     while request.status != "finished":
         batch_token_ids, batch_positions, batch_tables = scheduler.step()
         token_ids = torch.cat(batch_token_ids).unsqueeze(0)
         positions = torch.cat(batch_positions) #.unsqueeze(0)  {leads to wrong dim being repeated in expand step}  # (1, T) — batch dim for model   # (1, T)
-        logits, caches = our_model.forward(token_ids=token_ids, positions=positions, caches=caches)
+        logits, caches = our_model.forward(token_ids=token_ids, positions=positions, block_table=request.block_table, seq_len=num_prompt_tokens + request.tokens_generated)
         scheduler.update(logits)
 
 

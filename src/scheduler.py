@@ -65,6 +65,9 @@ class Scheduler:
                 table.add_block(self.allocator.allocate())
             curr_req.block_table = table
             curr_req.status = "running"
+            # after allocating prompt blocks, the last block isn't empty — it
+            # has num_prompt_tokens % block_size tokens already written into it
+            table.num_tokens_in_lastblock = curr_req.num_prompt_tokens % self.block_size
             self.running_list.append(curr_req)
 
         # BUILD THE BATCH

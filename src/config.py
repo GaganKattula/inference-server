@@ -17,6 +17,8 @@ class ModelConfig():
     vocab_size: int
     rms_norm_eps: float
     dtype: str # torch.float32, torch.float16
+    num_blocks: int
+    block_size: int
 
     @classmethod
     def llama_3_2_3b(cls):
@@ -33,6 +35,7 @@ class ModelConfig():
             rms_norm_eps=1e-05,
             act_fn='silu',
             dtype="bfloat16"
+            
                     )
 
 

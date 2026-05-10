@@ -110,7 +110,27 @@ def attention_kernel(Q, K_cache, V_cache, seq_len: int
     V = torch.repeat_interleave(V, n_rep, dim=1)
 
     scale = head_dim ** 0.5
-    attn_scores = torch.softmax((Q @ K.transpose(-2,-1))/ scale, dim = -1)# (B, T, T)
+
+    T_k = K.shape[2]   # could be longer than T if cache was used
+    T_q = Q.shape[2]
+
+    # Create a matrix of -inf
+    mask = torch.full((T_q, T_k), float('-inf'))
+    
+    # Zero out the lower triangle + diagonal — those are positions we CAN attend to
+    """
+    When T_q = 1 (decode) and T_k = 50(cached), torch.triu with diagonal=1 on a (1, 50) matrix would mask out everything except position 0.
+    But during decode, the single new token should attend to all previous positions. The fix: offset the
+    diagonal by T_k - T_q:
+
+    During prefill (T_q == T_k), this is diagonal=1 — same as before. During decode (T_q=1, T_k=50), this is
+    diagonal=50 — nothing gets masked in a (1, 50) matrix, which is correct since the new token can see
+    everything.
+    """
+    mask = torch.triu(mask, diagonal=T_k - T_q + 1)
+
+
+    attn_scores = torch.softmax((Q @ K.transpose(-2,-1)) / scale + mask, dim = -1)  # (B, T, T)
 
     output = attn_scores @ V
 

@@ -4,6 +4,7 @@ from src.config import ModelConfig
 from typing import List, Dict, Any, Optional, Tuple
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from src.paged_cache import BlockTable, attention_kernel
 
 class RMSNorm(nn.Module):
 
@@ -72,7 +73,9 @@ class AttentionGQA(nn.Module):
 
 
     def __init__(self, num_heads: int, d_model: int, num_kv_heads: int,
-                  head_dim: int, max_seq_len: int, rope_theta: float):
+                  head_dim: int, max_seq_len: int, rope_theta: float, 
+                  num_blocks: int, block_size: int
+                  ):
 
         super().__init__()
         self.num_heads=num_heads
@@ -87,8 +90,21 @@ class AttentionGQA(nn.Module):
         self.W_v = nn.Linear(d_model, head_dim * num_kv_heads, bias=False)
         self.W_o = nn.Linear(head_dim * num_heads, d_model, bias=False)
         self.rope = RoPE(head_dim, max_seq_len, rope_theta)
+        # Paged KV cache storage — pre-allocated once, shared across all requests.
+        # Shape: (num_blocks, n_kv_heads, block_size, head_dim)
+        # Think of it as a parking garage: num_blocks floors, block_size spots per floor,
+        # n_kv_heads cars per spot, head_dim values per car.
+        # Registered as buffers so they move to GPU with model.to(device) — not learned parameters.
+        # The block table (passed per call) maps logical blocks → physical blocks in this pool.
+        self.num_blocks=num_blocks
+        self.block_size=block_size
+        K_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim)
+        V_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim)
+        self.register_buffer('K_cache', K_cache)
+        self.register_buffer('V_cache', V_cache)
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor, cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
+    def forward(self, x: torch.Tensor, positions: torch.Tensor, cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                block_table: BlockTable=None , seq_len: int=None):
 
 
         query = self.W_q(x) # shape ( B, T, head_dim * num_heads)
@@ -106,12 +122,41 @@ class AttentionGQA(nn.Module):
         key = self.rope(key, positions)
         query = self.rope(query, positions)
         
-        if cache is not None:
-            cached_k, cached_v = cache
-            key = torch.cat([cached_k, key], dim=2)      # append along T
-            value = torch.cat([cached_v, value], dim=2)   # append along T
+        
+        if block_table is not None:
+            # PAGED PATH — block table provided, use physical block storage
 
-        updated_cache = (key, value)    # always store the full K, V for next step
+            # WRITE: scatter new K/V tokens into their physical blocks.
+            # For each new token at position t:
+            #   logical_block = t // block_size  (which block in the sequence)
+            #   slot          = t % block_size   (which position within that block)
+            #   physical      = block_table[logical_block]  (actual storage location)
+            for i, t in enumerate(positions):
+                t = t.item()
+                logical = t // self.block_size
+                slot = t % self.block_size
+                physical = block_table[logical]
+                self.K_cache[physical, slot, :, :] = key[0, :, i, :]   # (n_kv_heads, head_dim)
+                self.V_cache[physical, slot, :, :] = value[0, :, i, :]
+
+            # READ: gather the full K/V sequence from scattered physical blocks.
+            # attention_kernel vectorizes the gather using index arrays — no Python loop.
+            # seq_len tells the kernel how many tokens exist so far (prompt + generated).
+            output, attn_scores = attention_kernel(query, self.K_cache, self.V_cache, seq_len, self.block_size, block_table)
+
+            # Project back to d_model and return. No cache to return — storage is on the module.
+            output = output.transpose(1, 2).reshape(B, T, self.d_model)
+            output = self.W_o(output)
+            return output, None  # None: paged path owns its own storage, no external cache needed
+
+        elif cache is not None:
+            # CONTIGUOUS PATH — standard growing KV cache, concatenate new tokens onto existing cache
+            cached_k, cached_v = cache
+            key = torch.cat([cached_k, key], dim=2)      # append along T dim
+            value = torch.cat([cached_v, value], dim=2)
+
+        updated_cache = (key, value)    # always store the full K, V for next step 
+        # cache is a tuple (K, V) each of shape (B, num_kv_heads, T, head_dim) — and T grows by 1 every decode step as you cat onto it. 
 
         # expand key and value - repeat using the repeat factor "self.n_rep = num_heads // num_kv_heads"
         key = torch.repeat_interleave(key, self.n_rep, dim=1) # repeat along dim=1 — the heads dimension
@@ -184,17 +229,18 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(dim=config.embedding_dim, eps=config.rms_norm_eps)
         self.attention = AttentionGQA(num_heads=config.num_heads, d_model=config.embedding_dim,
                                          num_kv_heads=config.num_kv_heads, head_dim=config.head_dim,
-                                         max_seq_len=config.context_length, rope_theta=config.rope_theta)
+                                         max_seq_len=config.context_length, rope_theta=config.rope_theta,
+                                         num_blocks=config.num_blocks, block_size=config.block_size)
         self.ffn = SwiGLU_FFN(d_model=config.embedding_dim, d_ff=config.d_ff)
         
 
     
-    def forward(self, x,  positions, cache=None):
+    def forward(self, x,  positions, block_table: BlockTable=None , seq_len: int=None, cache=None):
         
         # Normalize the input
         residual1 = x
         x = self.attn_norm(x)
-        x, cache = self.attention(x, positions, cache)
+        x, cache = self.attention(x, positions, cache=cache, block_table=block_table, seq_len=seq_len)
         # Residual Connection
         x = x + residual1
 
@@ -240,14 +286,15 @@ class Decoder(nn.Module):
 
         
 
-    def forward(self, token_ids: torch.Tensor, positions, caches=None):
+    def forward(self, token_ids: torch.Tensor, positions, caches=None
+                , block_table: BlockTable=None , seq_len: int=None):
         # token_ids (B. T)
         x = self.embedding_matrix(token_ids) # input embeddings for the given sequence (B, T, d_model)
 
         updated_caches = []
         for i, layer in enumerate(self.layers):
             cache = caches[i] if caches is not None else None
-            x, updated_cache = layer(x, positions, cache)
+            x, updated_cache = layer(x, positions, cache=cache, block_table=block_table, seq_len=seq_len)
             updated_caches.append(updated_cache)
 
 
