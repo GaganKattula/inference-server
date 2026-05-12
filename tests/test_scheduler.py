@@ -56,12 +56,14 @@ def test_scheduler_equivalence():
 
     block_size = 4
     num_blocks = 20
-    prompt_tokens = [1, 450, 999, 310, 657, 338]  # arbitrary token IDs within vocab_size=1000
+    prompt_tokens = [1, 450, 999, 310, 657, 338, 123, 204, 302, 142]  # arbitrary token IDs within vocab_size=1000
     num_prompt_tokens = len(prompt_tokens)
     max_new_tokens = 5
+    chunk_size = 3
+    
 
     # 2. Created scheduler instance
-    scheduler = Scheduler(block_size, num_blocks)
+    scheduler = Scheduler(block_size, num_blocks, chunk_size)
     # 3. Created a request instance
     request = Request(request_id = 0, prompt_tokens=prompt_tokens, num_prompt_tokens=num_prompt_tokens,
                       max_new_tokens = max_new_tokens, block_table =None, arrival_time= time.time() )
@@ -71,11 +73,21 @@ def test_scheduler_equivalence():
 
     scheduler.add_request(request)  # enqueue once before the loop
     while request.status != "finished":
-        batch_token_ids, batch_positions, batch_tables = scheduler.step()
-        token_ids = torch.cat(batch_token_ids).unsqueeze(0)
-        positions = torch.cat(batch_positions) #.unsqueeze(0)  {leads to wrong dim being repeated in expand step}  # (1, T) — batch dim for model   # (1, T)
-        logits, caches = our_model.forward(token_ids=token_ids, positions=positions, block_table=request.block_table, seq_len=num_prompt_tokens + request.tokens_generated)
-        scheduler.update(logits)
+        
+        p_batch_token_ids, p_batch_positions, p_batch_tables, d_batch_token_ids, d_batch_positions, d_batch_tables, prefill_requests, decode_requests = scheduler.step()
+        if p_batch_token_ids:  
+            p_token_ids = torch.cat(p_batch_token_ids).unsqueeze(0)
+            p_positions = torch.cat(p_batch_positions) #.unsqueeze(0)  {leads to wrong dim being repeated in expand step}  # (1, T) — batch dim for model   # (1, T)
+            p_logits, caches = our_model.forward(token_ids=p_token_ids, positions=p_positions, block_table=request.block_table, seq_len=request.tokens_processed)
+
+            scheduler.update(p_logits, prefill_requests)
+
+        if d_batch_token_ids:
+            d_token_ids = torch.cat(d_batch_token_ids).unsqueeze(0)
+            d_positions = torch.cat(d_batch_positions)  
+            d_logits, caches = our_model.forward(token_ids=d_token_ids, positions=d_positions, block_table=request.block_table, seq_len=num_prompt_tokens + request.tokens_generated)
+
+            scheduler.update(d_logits, decode_requests)
 
 
     # 5. Generation w/o scheduler

@@ -22,6 +22,7 @@ class Request:
     tokens_generated: int = 0               # — int, starts at 0, increments each decode step
     status: str = "waiting"                         # — "waiting" | "running" | "finished"
     output_token_ids: List[int]= field(default_factory=list) # - default_factory=list creates a fresh empty list for each instance.
+    tokens_processed: int = 0           # - tracks how many prompt tokens have been processed so far, starting at 0 and incrementing by chunk size each step
 
 class Scheduler:
     """
@@ -43,15 +44,22 @@ class Scheduler:
     
     """
 
-    def __init__(self, block_size: int, num_blocks: int):
+    def __init__(self, block_size: int, num_blocks: int, chunk_size: int):
   
         self.num_blocks=num_blocks
         self.block_size=block_size
+        self.chunk_size=chunk_size
         self.wait_queue=deque()
         self.running_list=[]
         self.allocator=BlockAllocator(self.num_blocks)
         
     def step(self):
+        """
+        - Admits requests from wait_queue
+        - Allocated blocks 
+        - Builds batch - token ids, positions, block_tables (flat batch - prefill+decode )
+        - Returns the batch
+        """
 
         # ADMIT REQUESTS
         while self.wait_queue:
@@ -75,46 +83,65 @@ class Scheduler:
         what makes up a batch
         """
 
-        batch_token_ids = []
-        batch_positions = []
+        #batch_token_ids = []
+        prefill_batch_token_ids = []
+        #batch_positions = []
+        prefill_batch_positions = []
+
         # blocktables is rebuilt from scratch on every call to step()
         # local variable, not a persistent list.
-        batch_tables = []
+        #batch_tables = []
+        prefill_batch_tables = []
+
+        decode_batch_token_ids = []
+        decode_batch_positions = []
+        decode_batch_tables = []
+        prefill_req = []
+        decode_req = []
 
         for req in self.running_list:
 
-            if req.tokens_generated == 0:
+            if req.tokens_processed < req.num_prompt_tokens: # filter prefill requests
                 # PREFILL
-                token_ids = torch.tensor(req.prompt_tokens)
-                positions = torch.arange(req.num_prompt_tokens)
+                chunk_end = min(req.tokens_processed + self.chunk_size, req.num_prompt_tokens)
+                token_ids = torch.tensor(req.prompt_tokens[req.tokens_processed: chunk_end ])
+                positions = torch.arange(req.tokens_processed, chunk_end)
             
                     # assemble batch
-                batch_token_ids.append(token_ids)
-                batch_positions.append(positions)
-                batch_tables.append(req.block_table)
+                prefill_batch_token_ids.append(token_ids)
+                prefill_batch_positions.append(positions)
+                prefill_batch_tables.append(req.block_table)
 
-            elif req.tokens_generated < req.max_new_tokens:
+                prefill_req.append(req)
+                req.tokens_processed = chunk_end 
+
+            elif req.tokens_processed == req.num_prompt_tokens and req.tokens_generated < req.max_new_tokens: # filter decode requests
                 token_ids = torch.tensor([req.output_token_ids[-1]]) #(last generated token only)
                 positions = torch.tensor([req.num_prompt_tokens + req.tokens_generated - 1])
                     # assemble batch
-                batch_token_ids.append(token_ids)                
-                batch_positions.append(positions)
-                batch_tables.append(req.block_table)
+                decode_batch_token_ids.append(token_ids)                
+                decode_batch_positions.append(positions)
+                decode_batch_tables.append(req.block_table)
 
-        return batch_token_ids, batch_positions, batch_tables
+                decode_req.append(req)
+
+        return prefill_batch_token_ids, prefill_batch_positions, prefill_batch_tables, decode_batch_token_ids, decode_batch_positions, decode_batch_tables, prefill_req, decode_req
             
-    def update(self, logits: torch.Tensor):
+    def update(self, logits: torch.Tensor, requests: List[Request]):
         """
         1. Sample next token: argmax(logits) → token ID
         2. Append to output_token_ids
         3. Increment tokens_generated
-        4. Call block_table.append_token() — if it returns True, allocate a new block
-        5. Check if tokens_generated == max_new_tokens → if so, set status = "finished", free blocks, remove
-            from running_list
+        4. Call block_table.append_token() — if it returns True(if block is full), allocate a new block
+        5. Check if tokens_generated == max_new_tokens -> if so, set status = "finished", 
+                                                                free blocks, 
+                                                                remove from running_list                                                       
         """
 
-        for i, req in enumerate(self.running_list):
-
+        for i, req in enumerate(requests):
+            
+            if req.tokens_processed < req.num_prompt_tokens:
+                continue  # mid-prefill chunk, no token generated yet
             next_token_id = logits[i, -1, :].argmax().item()  # -1: last position (prefill or decode)
             req.tokens_generated += 1
 
