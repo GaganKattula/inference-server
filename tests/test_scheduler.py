@@ -63,7 +63,7 @@ def test_scheduler_equivalence():
     
 
     # 2. Created scheduler instance
-    scheduler = Scheduler(block_size, num_blocks, chunk_size)
+    scheduler = Scheduler(block_size, num_blocks, chunk_size, cache_type="paged")
     # 3. Created a request instance
     request = Request(request_id = 0, prompt_tokens=prompt_tokens, num_prompt_tokens=num_prompt_tokens,
                       max_new_tokens = max_new_tokens, block_table =None, arrival_time= time.time() )
@@ -74,7 +74,9 @@ def test_scheduler_equivalence():
     scheduler.add_request(request)  # enqueue once before the loop
     while request.status != "finished":
         
-        p_batch_token_ids, p_batch_positions, p_batch_tables, d_batch_token_ids, d_batch_positions, d_batch_tables, prefill_requests, decode_requests = scheduler.step()
+        p_batches, d_batches, prefill_requests, decode_requests = scheduler.step()
+        p_batch_token_ids, p_batch_positions, p_batch_tables = p_batches
+        d_batch_token_ids, d_batch_positions, d_batch_tables = d_batches
         if p_batch_token_ids:  
             p_token_ids = torch.cat(p_batch_token_ids).unsqueeze(0)
             p_positions = torch.cat(p_batch_positions) #.unsqueeze(0)  {leads to wrong dim being repeated in expand step}  # (1, T) — batch dim for model   # (1, T)
@@ -109,3 +111,5 @@ def test_scheduler_equivalence():
     assert request.output_token_ids == ref_tokens, (
         f"Paged output {request.output_token_ids} != reference {ref_tokens}"
     )
+
+    

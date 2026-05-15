@@ -115,8 +115,8 @@ def attention_kernel(Q, K_cache, V_cache, seq_len: int
     T_q = Q.shape[2]
 
     # Create a matrix of -inf
-    mask = torch.full((T_q, T_k), float('-inf'))
-    
+    mask = torch.full((T_q, T_k), float('-inf'), device=Q.device)
+
     # Zero out the lower triangle + diagonal — those are positions we CAN attend to
     """
     When T_q = 1 (decode) and T_k = 50(cached), torch.triu with diagonal=1 on a (1, 50) matrix would mask out everything except position 0.

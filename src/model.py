@@ -52,12 +52,18 @@ class RoPE(nn.Module):
     def forward(self, x: torch.Tensor, positions: torch.Tensor ): # Q or K matrices already projected to shape (B, n_heads, T, head_dim)
         
         #  fetch the cos and sin values for positions in the sequence and store in cos and sin
-        cos = self.costable[positions] #(seq_len, 128)
-        sin = self.sintable[positions] #(seq_len, 128)
+        # For batched positions (B, T):
+        cos = self.costable[positions] #(seq_len, 128)  # (B, T, head_dim)
+        sin = self.sintable[positions] #(seq_len, 128)  # (B, T, head_dim)
         
-        cos = cos.unsqueeze(0).unsqueeze(0)     # (1, 1, seq_len, 128) — ready to broadcast with x
-        
-        sin = sin.unsqueeze(0).unsqueeze(0)     # (1, 1, seq_len, 128)
+        if positions.dim() == 1:
+            # 1D positions: (T,) → cos/sin shape (T, head_dim) → (1, 1, T, head_dim)
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        else:
+            # 2D positions: (B, T) → cos/sin shape (B, T, head_dim) → (B, 1, T, head_dim)
+            cos = cos.unsqueeze(1)
+            sin = sin.unsqueeze(1)
 
         return x * cos + self._rotate_half(x) * sin
 
@@ -104,7 +110,9 @@ class AttentionGQA(nn.Module):
         self.register_buffer('V_cache', V_cache)
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor, cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                block_table: BlockTable=None , seq_len: int=None):
+                block_table: BlockTable=None, seq_len: int=None,
+                attention_mask: Optional[torch.Tensor]=None):
+        # attention_mask: (B, T_k) — 1 for real tokens, 0 for padding. None = no padding mask.
 
 
         query = self.W_q(x) # shape ( B, T, head_dim * num_heads)
@@ -168,7 +176,7 @@ class AttentionGQA(nn.Module):
         T_q = query.shape[2]
 
         # Create a matrix of -inf
-        mask = torch.full((T_q, T_k), float('-inf'))
+        mask = torch.full((T_q, T_k), float('-inf'), device=x.device)
         # Zero out the lower triangle + diagonal — those are positions we CAN attend to
         """
         When T_q = 1 (decode) and T_k = 50(cached), torch.triu with diagonal=1 on a (1, 50) matrix would mask out everything except position 0.
@@ -180,8 +188,21 @@ But during decode, the single new token should attend to all previous positions.
         everything.
         """
         mask = torch.triu(mask, diagonal=T_k - T_q + 1)
+        # Reshape causal mask to (1, 1, T_q, T_k) for explicit broadcasting over (B, n_heads, T_q, T_k)
+        mask = mask.unsqueeze(0).unsqueeze(0)
+
+        if attention_mask is not None:
+            # attention_mask: (B, T_k) — 1=real token, 0=padding
+            # Convert padding positions to -inf so softmax ignores them.
+            # Reshape to (B, 1, 1, T_k) to broadcast over (B, n_heads, T_q, T_k).
+            padding_mask = (1.0 - attention_mask.float()).unsqueeze(1).unsqueeze(2) * float('-inf')
+            padding_mask = padding_mask.to(x.device)
+            # Both masks now (B, 1, 1, T_k) and (1, 1, T_q, T_k) — broadcast cleanly to (B, 1, T_q, T_k)
+            mask = mask + padding_mask
 
         attn_scores = (query @ key.transpose(-2, -1))/ scale
+        # Apply combined causal + padding mask before softmax.
+        # -inf positions become ~0 after softmax — effectively ignored.
         attn_scores = torch.softmax(attn_scores + mask, dim=-1)
         output = attn_scores @ value
         
@@ -235,12 +256,16 @@ class TransformerBlock(nn.Module):
         
 
     
-    def forward(self, x,  positions, block_table: BlockTable=None , seq_len: int=None, cache=None):
-        
+    def forward(self, x, positions, block_table: BlockTable=None, seq_len: int=None, cache=None,
+                attention_mask: Optional[torch.Tensor]=None):
+        # attention_mask: (B, T_k) — passed through from Decoder, applied inside AttentionGQA
+
         # Normalize the input
         residual1 = x
         x = self.attn_norm(x)
-        x, cache = self.attention(x, positions, cache=cache, block_table=block_table, seq_len=seq_len)
+        # Thread attention_mask into attention — combines with causal mask inside AttentionGQA
+        x, cache = self.attention(x, positions, cache=cache, block_table=block_table, seq_len=seq_len,
+                                  attention_mask=attention_mask)
         # Residual Connection
         x = x + residual1
 
@@ -286,15 +311,25 @@ class Decoder(nn.Module):
 
         
 
-    def forward(self, token_ids: torch.Tensor, positions, caches=None
-                , block_table: BlockTable=None , seq_len: int=None):
-        # token_ids (B. T)
-        x = self.embedding_matrix(token_ids) # input embeddings for the given sequence (B, T, d_model)
+    def forward(self, token_ids: torch.Tensor, positions, caches=None,
+                block_table: BlockTable=None, seq_len: int=None,
+                attention_mask: Optional[torch.Tensor]=None):
+        """
+        Args:
+            token_ids:      (B, T) — pre-padded token IDs. Use collate_batch() from src/utils.py
+                            to build padded batches from variable-length sequences.
+            attention_mask: (B, T) — 1 for real tokens, 0 for padding. Passed down to AttentionGQA
+                            where it is combined with the causal mask. None = no padding mask.
+        """
+        # token_ids: (B, T) — embed to (B, T, d_model)
+        x = self.embedding_matrix(token_ids)
 
         updated_caches = []
         for i, layer in enumerate(self.layers):
             cache = caches[i] if caches is not None else None
-            x, updated_cache = layer(x, positions, cache=cache, block_table=block_table, seq_len=seq_len)
+            # Thread attention_mask through every layer — each TransformerBlock passes it to AttentionGQA
+            x, updated_cache = layer(x, positions, cache=cache, block_table=block_table, seq_len=seq_len,
+                                     attention_mask=attention_mask)
             updated_caches.append(updated_cache)
 
 

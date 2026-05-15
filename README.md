@@ -1,6 +1,6 @@
 # Inference Server
 
-A minimal vLLM-style LLM inference server implementing PagedAttention, continuous batching, and prefill/decode separation. Serves LLaMA 3.2 3B. Benchmarked against vLLM on identical hardware and workload.
+A minimal vLLM-style LLM inference server implementing PagedAttention, continuous batching, and prefill/decode separation. Serves LLaMA 3.2 3B. Benchmarked pssioagainst vLLM on identical hardware and workload.
 
 ## Features
 
